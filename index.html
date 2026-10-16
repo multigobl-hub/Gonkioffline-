@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<style>
+  html,body{margin:0;height:100%;background:#111;overflow:hidden}
+  canvas{display:block;margin:auto;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// @ts-nocheck
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+let W, H, roadW, laneW;
+function resize(){
+  W = cv.width  = Math.min(window.innerWidth, 480);
+  H = cv.height = window.innerHeight;
+  roadW = W * 0.8;
+  laneW = roadW / 3;
+}
+resize();
+addEventListener('resize', () => { resize(); player.y = H - 140; });
+
+// ---------- ЗВУК ----------
+let audioCtx = null;
+const LS_SOUND = 'race_sound_v1';
+let soundEnabled = localStorage.getItem(LS_SOUND) !== '0';
+let firstTapPlayed = false;
+
+function initAudio(){
+  if (!audioCtx){
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch(e){ audioCtx = null; }
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function beep(freq, duration, type, volume){
+  if (!soundEnabled || !audioCtx) return;
+  const osc  = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'sine';
+  osc.frequency.value = freq;
+  const now = audioCtx.currentTime;
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(volume || 0.06, now + 0.015);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start(now);
+  osc.stop(now + duration + 0.03);
+}
+
+function playCoin(){
+  beep(880, 0.09, 'sine', 0.055);
+  setTimeout(() => beep(1320, 0.11, 'sine', 0.05), 60);
+}
+function playCrash(){
+  beep(150, 0.35, 'sawtooth', 0.07);
+  setTimeout(() => beep(90, 0.45, 'sawtooth', 0.06), 90);
+}
+function playStart(){
+  beep(440, 0.1, 'sine', 0.05);
+  setTimeout(() => beep(660, 0.1, 'sine', 0.05), 100);
+  setTimeout(() => beep(880, 0.14, 'sine', 0.05), 200);
+}
+function playClick(){ beep(700, 0.05, 'square', 0.04); }
+
+// ---------- СОХРАНЕНИЯ ----------
+const LS_COINS = 'race_coins_v1';
+const LS_BEST  = 'race_best_v1';
+const RESPAWN_COST = 50;
+
+let coinsCollected = parseInt(localStorage.getItem(LS_COINS) || '0', 10);
+let best           = parseInt(localStorage.getItem(LS_BEST)  || '0', 10);
+
+function saveProgress(){
+  localStorage.setItem(LS_COINS, String(coinsCollected));
+  localStorage.setItem(LS_BEST,  String(best));
+}
+
+// ---------- ИГРОК ----------
+const player = { x: 0, y: 0, w: 44, h: 76, speed: 0 };
+player.x = W/2; player.y = H - 140;
+
+// ---------- СОСТОЯНИЕ ----------
+let enemies = [];
+let coins   = [];
+let rocks   = [];
+let roadOffset = 0;
+let speed = 6;
+let score = 0;
+let gameOver = false;
+let paused = false;
+let spawnTimer = 0;
+let coinTimer  = 0;
+let rockTimer  = 0;
+let invincibleFrames = 0;
+
+const buttons = {};
+const GEAR_R = 22;
+const gearPos = { x: 0, y: 0, r: GEAR_R + 8 };
+
+// ---------- СПАВН ----------
+function spawnEnemy(forcedLane){
+  const lane = (forcedLane !== undefined) ? forcedLane : Math.floor(Math.random()*3);
+  const laneCenterX = (W - roadW)/2 + lane*laneW + laneW/2;
+  const offset = (Math.random() - 0.5) * laneW * 0.6;
+  const x = laneCenterX + offset;
+  enemies.push({
+    x, y: -120, w: 44, h: 76, lane, passed: false,
+    color: ['#c62828','#1565c0','#6a1b9a','#ef6c00','#00838f'][Math.floor(Math.random()*5)]
+  });
+}
+function spawnCoin(){
+  const lane = Math.floor(Math.random()*3);
+  const x = (W - roadW)/2 + lane*laneW + laneW/2;
+  coins.push({ x, y: -60, r: 14, alive: true });
+}
+function spawnRock(){
+  const roadX = (W - roadW)/2;
+  const side = Math.random() < 0.5 ? 0 : 1;
+  const x = side === 0 ? roadX + 26 : roadX + roadW - 26;
+  rocks.push({ x, y: -50, r: 16 + Math.random()*6, seed: Math.random()*10 });
+}
+
+// ---------- ЛОГИКА ----------
+function update(){
+  if (gameOver || paused) return;
+  if (invincibleFrames > 0) invincibleFrames--;
+
+  speed = 5 + score * 0.06;
+  if (speed > 11) speed = 11;
+
+  roadOffset = (roadOffset + speed) % 80;
+
+  player.x += player.speed;
+  const left  = (W - roadW)/2 + player.w/2;
+  const right = (W + roadW)/2 - player.w/2;
+  if (player.x < left)  player.x = left;
+  if (player.x > right) player.x = right;
+  player.speed *= 0.9;
+
+  spawnTimer++;
+  const spawnGap = Math.max(28, 85 - score * 0.9);
+  if (spawnTimer > spawnGap){
+    spawnTimer = 0;
+    const laneA = Math.floor(Math.random()*3);
+    spawnEnemy(laneA);
+    if (score > 30 && Math.random() < 0.15){
+      const laneB = (laneA + 1 + Math.floor(Math.random()*2)) % 3;
+      spawnEnemy(laneB);
+    }
+  }
+
+  coinTimer++;
+  if (coinTimer > 180 && Math.random() < 0.4){
+    coinTimer = 0;
+    spawnCoin();
+  }
+
+  rockTimer++;
+  if (rockTimer > 400 && rocks.length === 0 && Math.random() < 0.35){
+    rockTimer = 0;
+    spawnRock();
+  }
+
+  for (let e of enemies){
+    e.y += speed;
+    if (!e.passed && e.y > player.y + player.h/2){
+      e.passed = true;
+      score++;
+    }
+  }
+  enemies = enemies.filter(e => e.y < H + 200);
+
+  for (let c of coins) c.y += speed;
+  coins = coins.filter(c => c.y < H + 100 && c.alive);
+
+  for (let r of rocks) r.y += speed;
+  rocks = rocks.filter(r => r.y < H + 100);
+
+  if (invincibleFrames <= 0){
+    for (let e of enemies){
+      if (Math.abs(e.x - player.x) < (e.w+player.w)/2*0.82 &&
+          Math.abs(e.y - player.y) < (e.h+player.h)/2*0.82){
+        crash();
+      }
+    }
+    for (let r of rocks){
+      const dx = r.x - player.x, dy = r.y - player.y;
+      const rad = r.r + player.w/2*0.8;
+      if (dx*dx + dy*dy < rad*rad) crash();
+    }
+  }
+
+  for (let c of coins){
+    if (!c.alive) continue;
+    const dx = c.x - player.x, dy = c.y - player.y;
+    if (dx*dx + dy*dy < (c.r + player.w/2) * (c.r + player.w/2)){
+      c.alive = false;
+      coinsCollected++;
+      saveProgress();
+      playCoin();
+    }
+  }
+}
+
+function crash(){
+  gameOver = true;
+  playCrash();
+  if (score > best){ best = score; saveProgress(); }
+}
+
+// ---------- РИСОВАНИЕ ----------
+function drawRoad(){
+  ctx.fillStyle = '#1b5e20';
+  ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = '#2e7d32';
+  for (let y = -80 + roadOffset; y < H; y += 80){
+    ctx.fillRect(0, y, (W-roadW)/2, 40);
+    ctx.fillRect((W+roadW)/2, y, (W-roadW)/2, 40);
+  }
+  const roadX = (W - roadW)/2;
+  ctx.fillStyle = '#3a3a3a';
+  ctx.fillRect(roadX, 0, roadW, H);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(roadX-4, 0, 4, H);
+  ctx.fillRect(roadX+roadW, 0, 4, H);
+  ctx.fillStyle = '#eee';
+  for (let i=1;i<3;i++){
+    const x = roadX + i*laneW - 2;
+    for (let y = -80 + roadOffset; y < H; y += 80){
+      ctx.fillRect(x, y, 4, 40);
+    }
+  }
+}
+
+function drawRaceCar(x, y, w, h, color, isPlayer){
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath(); ctx.ellipse(2, 4, w*0.55, h*0.5, 0, 0, Math.PI*2); ctx.fill();
+  const hw = w/2, hh = h/2;
+  ctx.fillStyle = '#111';
+  ctx.fillRect(-hw-2, hh-10, w+4, 6);
+  ctx.beginPath();
+  ctx.moveTo(0, -hh);
+  ctx.lineTo(hw*0.7, -hh*0.3);
+  ctx.lineTo(hw, hh*0.5);
+  ctx.lineTo(hw*0.9, hh);
+  ctx.lineTo(-hw*0.9, hh);
+  ctx.lineTo(-hw, hh*0.5);
+  ctx.lineTo(-hw*0.7, -hh*0.3);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.moveTo(0, -hh*0.9);
+  ctx.lineTo(hw*0.15, -hh*0.2);
+  ctx.lineTo(hw*0.15, hh*0.6);
+  ctx.lineTo(-hw*0.15, hh*0.6);
+  ctx.lineTo(-hw*0.15, -hh*0.2);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = isPlayer ? '#8ecbff' : '#7a8a99';
+  ctx.beginPath();
+  ctx.moveTo(-hw*0.55, -hh*0.15);
+  ctx.lineTo(hw*0.55, -hh*0.15);
+  ctx.lineTo(hw*0.45, hh*0.15);
+  ctx.lineTo(-hw*0.45, hh*0.15);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.beginPath();
+  ctx.moveTo(-hw*0.5, hh*0.3);
+  ctx.lineTo(hw*0.5, hh*0.3);
+  ctx.lineTo(hw*0.4, hh*0.55);
+  ctx.lineTo(-hw*0.4, hh*0.55);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#111';
+  ctx.fillRect(-hw-2, -hh*0.55, 5, hh*0.35);
+  ctx.fillRect( hw-3, -hh*0.55, 5, hh*0.35);
+  ctx.fillRect(-hw-2,  hh*0.15, 5, hh*0.4);
+  ctx.fillRect( hw-3,  hh*0.15, 5, hh*0.4);
+  if (isPlayer){
+    ctx.fillStyle = '#ffe082';
+    ctx.fillRect(-hw*0.5, -hh+1, 4, 4);
+    ctx.fillRect( hw*0.5-4, -hh+1, 4, 4);
+  }
+  ctx.restore();
+}
+
+function drawCoin(c){
+  ctx.save();
+  ctx.translate(c.x, c.y);
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.beginPath(); ctx.ellipse(2, 3, c.r, c.r*0.7, 0, 0, Math.PI*2); ctx.fill();
+  const g = ctx.createRadialGradient(-4,-4,2,0,0,c.r);
+  g.addColorStop(0, '#fff59d');
+  g.addColorStop(0.6, '#ffd54f');
+  g.addColorStop(1, '#f9a825');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0,0,c.r,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#b8860b'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = '#8d6e00';
+  ctx.font = 'bold 16px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('₴', 0, 1);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
+}
+
+function drawRock(r){
+  ctx.save();
+  ctx.translate(r.x, r.y);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath(); ctx.ellipse(3, 4, r.r*0.95, r.r*0.75, 0, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath();
+  const sides = 9;
+  for (let i=0;i<sides;i++){
+    const a = i/sides * Math.PI*2;
+    const rr = r.r * (0.75 + ((Math.sin(r.seed + i*2.1)+1)/2)*0.35);
+    const px = Math.cos(a)*rr;
+    const py = Math.sin(a)*rr;
+    if (i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+  }
+  ctx.closePath();
+  const g = ctx.createRadialGradient(-r.r*0.3,-r.r*0.3,2,0,0,r.r);
+  g.addColorStop(0, '#a8a8a8');
+  g.addColorStop(0.7, '#616161');
+  g.addColorStop(1, '#2f2f2f');
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-r.r*0.3, -r.r*0.2);
+  ctx.lineTo(0, 0);
+  ctx.lineTo(r.r*0.2, r.r*0.4);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawHUD(){
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(10, 10, 175, 95);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 18px sans-serif';
+  ctx.fillText('Обгон: ' + score, 20, 35);
+  ctx.fillStyle = '#ffd54f';
+  ctx.fillText('₴ ' + coinsCollected, 20, 62);
+  ctx.fillStyle = '#8ecbff';
+  ctx.font = '16px sans-serif';
+  ctx.fillText('Рекорд: ' + best, 20, 88);
+}
+
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y,   x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x,   y+h, r);
+  ctx.arcTo(x,   y+h, x,   y,   r);
+  ctx.arcTo(x,   y,   x+w, y,   r);
+  ctx.closePath();
+}
+
+function drawGearIcon(cx, cy, r, color){
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.fillStyle = color;
+  const teeth = 8;
+  for (let i=0;i<teeth;i++){
+    const a = i/teeth * Math.PI*2;
+    ctx.save();
+    ctx.rotate(a);
+    ctx.fillRect(-3.5, -r-4, 7, 7);
+    ctx.restore();
+  }
+  ctx.beginPath();
+  ctx.arc(0,0,r,0,Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.beginPath();
+  ctx.arc(0,0,r*0.42,0,Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawSpeakerIcon(cx, cy, size, enabled){
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.fillStyle = enabled ? '#fff' : '#888';
+  ctx.beginPath();
+  ctx.moveTo(-size*0.5, -size*0.22);
+  ctx.lineTo(-size*0.2, -size*0.22);
+  ctx.lineTo(size*0.05, -size*0.5);
+  ctx.lineTo(size*0.05,  size*0.5);
+  ctx.lineTo(-size*0.2,  size*0.22);
+  ctx.lineTo(-size*0.5,  size*0.22);
+  ctx.closePath();
+  ctx.fill();
+  if (enabled){
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(size*0.1, 0, size*0.28, -Math.PI/3, Math.PI/3); ctx.stroke();
+    ctx.beginPath(); ctx.arc(size*0.1, 0, size*0.48, -Math.PI/3, Math.PI/3); ctx.stroke();
+  } else {
+    ctx.strokeStyle = '#e53935';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(size*0.15, -size*0.3);
+    ctx.lineTo(size*0.55,  size*0.3);
+    ctx.moveTo(size*0.55, -size*0.3);
+    ctx.lineTo(size*0.15,  size*0.3);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawPauseOverlay(){
+  ctx.fillStyle = 'rgba(0,0,0,0.82)';
+  ctx.fillRect(0,0,W,H);
+  ctx.textAlign = 'center';
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 34px sans-serif';
+  ctx.fillText('Пауза', W/2, H/2 - 170);
+
+  const btnW = 250, btnH = 58;
+  const bx = W/2 - btnW/2;
+  const contY   = H/2 - 110;
+  const restY   = H/2 - 35;
+  const soundY  = H/2 + 40;
+
+  buttons.pauseContinue = { x:bx, y:contY,  w:btnW, h:btnH };
+  buttons.pauseRestart  = { x:bx, y:restY,  w:btnW, h:btnH };
+  buttons.pauseSound    = { x:bx, y:soundY, w:btnW, h:btnH };
+
+  ctx.fillStyle = '#2e7d32';
+  roundRect(bx, contY, btnW, btnH, 14); ctx.fill();
+  ctx.strokeStyle = '#66bb6a'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 20px sans-serif';
+  ctx.fillText('Продолжить', W/2, contY + 37);
+
+  ctx.fillStyle = '#c62828';
+  roundRect(bx, restY, btnW, btnH, 14); ctx.fill();
+  ctx.strokeStyle = '#ef5350'; ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.fillText('Начать заново', W/2, restY + 37);
+
+  ctx.fillStyle = soundEnabled ? '#1565c0' : '#3a3a3a';
+  roundRect(bx, soundY, btnW, btnH, 14); ctx.fill();
+  ctx.strokeStyle = soundEnabled ? '#42a5f5' : '#555'; ctx.stroke();
+
+  drawSpeakerIcon(bx + 45, soundY + btnH/2, 30, soundEnabled);
+
+  ctx.fillStyle = soundEnabled ? '#fff' : '#aaa';
+  ctx.font = 'bold 18px sans-serif';
+  ctx.fillText(soundEnabled ? 'Звук: вкл' : 'Звук: выкл', W/2 + 20, soundY + 37);
+
+  ctx.textAlign = 'left';
+}
+
+function draw(){
+  drawRoad();
+  for (let r of rocks) drawRock(r);
+  for (let c of coins) if (c.alive) drawCoin(c);
+  for (let e of enemies) drawRaceCar(e.x, e.y, e.w, e.h, e.color, false);
+
+  const blink = invincibleFrames > 0 && Math.floor(invincibleFrames/5)%2===0;
+  if (!blink){
+    drawRaceCar(player.x, player.y, player.w, player.h, '#ffca28', true);
+  }
+
+  drawHUD();
+
+  if (!gameOver && !paused){
+    gearPos.x = W - 40;
+    gearPos.y = 45;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.beginPath();
+    ctx.arc(gearPos.x, gearPos.y, GEAR_R + 8, 0, Math.PI*2);
+    ctx.fill();
+    drawGearIcon(gearPos.x, gearPos.y, GEAR_R * 0.7, '#ddd');
+  }
+
+  if (gameOver){
+    ctx.fillStyle = 'rgba(0,0,0,0.78)';
+    ctx.fillRect(0,0,W,H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 34px sans-serif';
+    ctx.fillText('Авария!', W/2, H/2 - 140);
+    ctx.font = '22px sans-serif';
+    ctx.fillText('Обгонов: ' + score, W/2, H/2 - 90);
+    ctx.fillStyle = '#ffd54f';
+    ctx.fillText('Монет: ' + coinsCollected, W/2, H/2 - 55);
+    ctx.fillStyle = '#8ecbff';
+    ctx.font = '16px sans-serif';
+    ctx.fillText('Рекорд: ' + best, W/2, H/2 - 25);
+
+    const btnW = 250, btnH = 58;
+    const bx = W/2 - btnW/2;
+    const respawnY = H/2 + 15;
+    const restartY = H/2 + 90;
+    const canRespawn = coinsCollected >= RESPAWN_COST;
+    buttons.respawn = { x:bx, y:respawnY, w:btnW, h:btnH, enabled: canRespawn };
+    buttons.restart = { x:bx, y:restartY, w:btnW, h:btnH, enabled: true };
+
+    ctx.fillStyle = canRespawn ? '#2e7d32' : '#3a3a3a';
+    roundRect(bx, respawnY, btnW, btnH, 14); ctx.fill();
+    ctx.strokeStyle = canRespawn ? '#66bb6a' : '#555';
+    ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = canRespawn ? '#fff' : '#888';
+    ctx.font = 'bold 19px sans-serif';
+    ctx.fillText(
+      canRespawn ? 'Возродиться  -' + RESPAWN_COST + ' ₴' : 'Не хватает монет (нужно ' + RESPAWN_COST + ')',
+      W/2, respawnY + 37
+    );
+
+    ctx.fillStyle = '#c62828';
+    roundRect(bx, restartY, btnW, btnH, 14); ctx.fill();
+    ctx.strokeStyle = '#ef5350'; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 19px sans-serif';
+    ctx.fillText('Начать заново', W/2, restartY + 37);
+    ctx.textAlign = 'left';
+  } else if (paused){
+    drawPauseOverlay();
+  }
+}
+
+function loop(){
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+
+// ---------- УПРАВЛЕНИЕ ----------
+function getPos(e){
+  const r = cv.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+function inRect(p, r){
+  return r && p.x >= r.x && p.x <= r.x+r.w && p.y >= r.y && p.y <= r.y+r.h;
+}
+function inCircle(p, cx, cy, r){
+  const dx = p.x - cx, dy = p.y - cy;
+  return dx*dx + dy*dy <= r*r;
+}
+
+let touchX = null;
+
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  initAudio();
+  if (!firstTapPlayed){ firstTapPlayed = true; playStart(); }
+
+  const p = getPos(e);
+
+  if (paused){
+    if (inRect(p, buttons.pauseContinue)){ playClick(); paused = false; return; }
+    if (inRect(p, buttons.pauseRestart)){  playClick(); paused = false; restart(); return; }
+    if (inRect(p, buttons.pauseSound)){
+      soundEnabled = !soundEnabled;
+      localStorage.setItem(LS_SOUND, soundEnabled ? '1' : '0');
+      if (soundEnabled) playClick();
+      return;
+    }
+    return;
+  }
+
+  if (gameOver){
+    if (inRect(p, buttons.respawn) && buttons.respawn.enabled){ playClick(); respawnForCoins(); return; }
+    if (inRect(p, buttons.restart) && buttons.restart.enabled){ playClick(); restart(); return; }
+    return;
+  }
+
+  if (inCircle(p, gearPos.x, gearPos.y, gearPos.r)){
+    playClick();
+    paused = true;
+    touchX = null;
+    return;
+  }
+
+  touchX = p.x;
+}, {passive:false});
+
+cv.addEventListener('pointermove', e => {
+  if (touchX == null || gameOver || paused) return;
+  e.preventDefault();
+  const p = getPos(e);
+  player.speed = (p.x - touchX) * 0.85;
+  touchX = p.x;
+}, {passive:false});
+
+cv.addEventListener('pointerup',     () => touchX = null);
+cv.addEventListener('pointercancel', () => touchX = null);
+
+addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !gameOver){
+    paused = !paused;
+    return;
+  }
+  if (paused || gameOver) return;
+  if (e.key==='ArrowLeft')  player.speed = -8;
+  if (e.key==='ArrowRight') player.speed =  8;
+});
+
+// ---------- ВОЗРОЖДЕНИЕ / НОВАЯ ИГРА ----------
+function respawnForCoins(){
+  if (coinsCollected < RESPAWN_COST) return;
+  coinsCollected -= RESPAWN_COST;
+  saveProgress();
+
+  const safeY = player.y - 260;
+  enemies = enemies.filter(e => e.y < safeY);
+  rocks   = rocks.filter(r => r.y < safeY);
+  coins   = coins.filter(c => c.y < safeY);
+
+  spawnTimer = 0; coinTimer = 0; rockTimer = 0;
+  player.x = W/2;
+  player.speed = 0;
+  gameOver = false;
+  paused = false;
+  invincibleFrames = 120;
+}
+
+function restart(){
+  enemies = [];
+  coins = [];
+  rocks = [];
+  score = 0;
+  speed = 6;
+  roadOffset = 0;
+  spawnTimer = 0; coinTimer = 0; rockTimer = 0;
+  player.x = W/2;
+  player.speed = 0;
+  gameOver = false;
+  paused = false;
+  invincibleFrames = 0;
+  playStart();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && !gameOver && !paused) paused = true;
+});
+</script>
+</body>
+</html>
