@@ -10,15 +10,25 @@
 </head>
 <body>
 <canvas id="c"></canvas>
+
+<!-- BEGIN AADS AD UNIT 2458669 -->
+<div id="aads-banner" style="position:fixed;bottom:0;left:0;right:0;text-align:center;z-index:99998;background:#111;padding:2px 0;">
+  <iframe data-aa='2458669' src='//acceptable.a-ads.com/2458669/?size=Adaptive'
+          style='border:0;padding:0;width:100%;height:50px;overflow:hidden;display:block;margin:auto;'></iframe>
+</div>
+<!-- END AADS AD UNIT 2458669 -->
+
 <script>
 // @ts-nocheck
 const cv = document.getElementById('c');
 const ctx = cv.getContext('2d');
 
 let W, H, roadW, laneW;
+const AD_HEIGHT = 56;
+
 function resize(){
   W = cv.width  = Math.min(window.innerWidth, 480);
-  H = cv.height = window.innerHeight;
+  H = cv.height = window.innerHeight - AD_HEIGHT;
   roadW = W * 0.8;
   laneW = roadW / 3;
 }
